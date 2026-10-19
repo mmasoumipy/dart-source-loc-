@@ -1,0 +1,32 @@
+# Leave-one-segment-out on the 6 patient EUS segments.
+# Fold k: test = segment k, val = segment (k mod 6) + 1, train = the remaining four.
+model: weights/yolo26s-obb.pt   # main model (s); m is weights/yolo26m-obb.pt with batch 4
+data_dir: data/prepared            # masked frames from src/data/prepare.py
+exclude_suspicious_empty_from_train: true
+
+train:
+  imgsz: 1024
+  epochs: 80
+  patience: 20
+  batch: 8        # 12 GB GPU at imgsz 1024: s fits 8, m fits 4; Ultralytics accumulates gradients to nbs=64
+  deterministic: false  # deterministic mode OOMs at batch 4
+  workers: 8
+  optimizer: auto
+  cos_lr: true
+  amp: true
+  # ultrasound-plausible augmentation
+  fliplr: 0.0      # needle exits the EUS channel on a fixed side
+  flipud: 0.0
+  degrees: 0.0
+  scale: 0.3
+  translate: 0.1
+  hsv_h: 0.0
+  hsv_s: 0.0
+  hsv_v: 0.3
+  mosaic: 1.0
+  close_mosaic: 10
+  plots: true
+
+predict:
+  conf: 0.001      # keep (almost) everything; thresholds are swept offline
+  max_det: 20
