@@ -1,0 +1,21 @@
+# data (keep local / on Drive, never in git)
+EUS_segments/
+*.zip
+*.png
+*.jpg
+*.mp4
+!results/figures/*.png
+
+# training outputs and weights
+runs/
+*.pt
+*.onnx
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+
+ROADMAP.md
