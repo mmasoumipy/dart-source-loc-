@@ -1,13 +1,20 @@
 """Centre-based evaluation of LOSO predictions: visibility (RQ1), localization (RQ2), reliability (RQ3).
 
-Usage: python -m src.eval.evaluate --name loso_s --seed 0 [--gate-mm 5]
+Usage: python -m src.eval.evaluate --name loso_s --seed 0 [--gate-mm 5] [--calib pooled]
 
 Definitions
   top-1        the highest-confidence prediction in a frame (conf 0 if none); the system's answer for that frame.
   correct      the frame has a labelled seed and the top-1 centre is within gate_mm of a labelled centre.
+  correct_line the frame has a labelled seed and the top-1 centre is within LINE_MM of the labelled source axis
+               (ignores the position along the source, which is ambiguous for long visible tracks).
   ambiguous    empty-label frame in a short gap between labelled frames (likely missed label), unless reviewed as
                'absent' in review/negatives_reviewed.csv; excluded from visibility and reliability metrics.
   calibrated   Platt scaling on logit(conf), fitted on the fold's validation segment and applied to its test segment.
+               With --calib pooled, the threshold and Platt fit use the validation frames of every fold whose
+               validation segment is not this fold's test segment (outputs go to s<seed>_pooledcal/).
+  fp_per_frame detections above the threshold that match no labelled seed, per non-ambiguous frame.
+  short/long   labelled visible length < 12 mm (partly visible) or >= 12 mm (fully in plane).
+  background   phantom or tissue per segment, from configs/backgrounds.yaml.
 
 Outputs: results/metrics/<name>/s<seed>/{frames.csv, detections.csv, folds.csv, pooled.csv}
 """
@@ -21,12 +28,13 @@ from scipy.stats import spearmanr
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, roc_auc_score, roc_curve
 
-from src.data.io import load_boxes, load_manifest, obb_geometry
-from src.train import fold_segments
+from src.data.io import fold_segments, load_boxes, load_manifest, obb_geometry
 
 ROOT = Path(__file__).resolve().parents[2]
 MM_PER_PX = yaml.safe_load((ROOT / "configs" / "pixel_spacing.yaml").read_text())["mm_per_px"]
 EPS = 1e-6
+LINE_MM = 2.0
+TARGETS = {"": "correct", "_line": "correct_line"}
 
 
 # ---------- ground truth ----------
@@ -35,9 +43,10 @@ def load_gt():
     m = load_manifest()
     rows = []
     for r in m[m.n_boxes > 0].itertuples():
-        c, long_, _, _ = obb_geometry(load_boxes(r.label_path, r.width, r.height))
+        c, long_, _, ang = obb_geometry(load_boxes(r.label_path, r.width, r.height))
         for i in range(len(c)):
-            rows.append(dict(segment=r.segment, frame=r.frame, gx=c[i, 0], gy=c[i, 1], long_mm=long_[i] * MM_PER_PX))
+            rows.append(dict(segment=r.segment, frame=r.frame, gx=c[i, 0], gy=c[i, 1], long_mm=long_[i] * MM_PER_PX,
+                             ux=np.cos(np.radians(ang[i])), uy=np.sin(np.radians(ang[i]))))
     return m, pd.DataFrame(rows)
 
 
@@ -60,20 +69,27 @@ def frame_table(pred, m, gt, segment, amb, gate_mm):
     frames = frames.merge(p[["frame", "conf", "cx", "cy"]], on="frame", how="left")
     frames["conf"] = frames.conf.fillna(0.0)
     g = gt[gt.segment == segment].groupby("frame")
-    err, length = [], []
+    err, along, cross, length = [], [], [], []
     for r in frames.itertuples():
         if r.n_boxes == 0 or r.frame not in g.groups or np.isnan(r.cx):
-            err.append(np.nan)
+            err.append(np.nan); along.append(np.nan); cross.append(np.nan)
             length.append(g.get_group(r.frame).long_mm.max() if r.frame in g.groups else np.nan)
             continue
         gg = g.get_group(r.frame)
-        d = np.hypot(gg.gx - r.cx, gg.gy - r.cy) * MM_PER_PX
-        err.append(d.min())
-        length.append(gg.long_mm.iloc[int(np.argmin(d))])
+        dx, dy = (r.cx - gg.gx).to_numpy(), (r.cy - gg.gy).to_numpy()
+        i = int(np.argmin(np.hypot(dx, dy)))
+        err.append(np.hypot(dx[i], dy[i]) * MM_PER_PX)
+        # offset along the labelled source axis and perpendicular to it
+        along.append(abs(dx[i] * gg.ux.iloc[i] + dy[i] * gg.uy.iloc[i]) * MM_PER_PX)
+        cross.append(abs(-dx[i] * gg.uy.iloc[i] + dy[i] * gg.ux.iloc[i]) * MM_PER_PX)
+        length.append(gg.long_mm.iloc[i])
     frames["err_mm"] = err
+    frames["err_along_mm"] = along
+    frames["err_cross_mm"] = cross
     frames["gt_long_mm"] = length
     frames["has_seed"] = frames.n_boxes > 0
     frames["correct"] = frames.has_seed & (frames.err_mm <= gate_mm)
+    frames["correct_line"] = frames.has_seed & (frames.err_cross_mm <= LINE_MM)
     frames["ambiguous"] = [(s, f) in amb for s, f in zip(frames.segment, frames.frame)]
     return frames
 
@@ -138,11 +154,11 @@ def logit(p):
     return np.log(p / (1 - p))
 
 
-def platt(val_frames):
+def platt(val_frames, target="correct"):
     v = val_frames[~val_frames.ambiguous]
-    if v.correct.nunique() < 2:
+    if v[target].nunique() < 2:
         return lambda c: np.asarray(c, float)
-    lr = LogisticRegression(C=1e4).fit(logit(v.conf.to_numpy())[:, None], v.correct.to_numpy())
+    lr = LogisticRegression(C=1e4).fit(logit(v.conf.to_numpy())[:, None], v[target].to_numpy())
     return lambda c: lr.predict_proba(logit(np.asarray(c, float))[:, None])[:, 1]
 
 
@@ -154,34 +170,47 @@ def youden_threshold(frames):
     return float(thr[np.argmax(tpr - fpr)])
 
 
-def summarize(test, dets, n_gt, thr, gate_mm):
+def summarize(test, dets, n_gt, gate_mm):
+    test = test.assign(above=test.conf >= test.threshold)
     f = test[~test.ambiguous]
     pos = test[test.has_seed]
     out = dict(frames=len(test), frames_ambiguous=int(test.ambiguous.sum()), frames_with_seed=int(test.has_seed.sum()),
-               seeds=n_gt, threshold=thr)
+               seeds=n_gt)
     # RQ1 visibility
     if f.has_seed.nunique() == 2:
         out.update(vis_auroc=roc_auc_score(f.has_seed, f.conf), vis_auprc=average_precision_score(f.has_seed, f.conf))
-    out.update(vis_sensitivity=float((pos.conf >= thr).mean()) if len(pos) else np.nan,
-               vis_specificity=float((f[~f.has_seed].conf < thr).mean()) if (~f.has_seed).any() else np.nan)
+    out.update(vis_sensitivity=float(pos.above.mean()) if len(pos) else np.nan,
+               vis_specificity=float((~f[~f.has_seed].above).mean()) if (~f.has_seed).any() else np.nan)
     # RQ2 localization (top-1 on frames with a seed)
-    det = pos[pos.conf >= thr]
+    det = pos[pos.above]
+    d = dets.merge(test[["segment", "frame", "threshold", "ambiguous"]], on=["segment", "frame"])
+    d = d[~d.ambiguous & (d.conf >= d.threshold)]
+    out.update(fp_per_frame=float((~d.tp).sum() / max(len(f), 1)),
+               fp_per_empty_frame=float((~d[d.frame.isin(f[~f.has_seed].frame)].tp).sum() / max((~f.has_seed).sum(), 1)))
     out.update(centre_ap=centre_ap(dets, n_gt),
                loc_detected_frac=len(det) / max(len(pos), 1),
                loc_err_median_mm=det.err_mm.median(), loc_err_q25_mm=det.err_mm.quantile(.25),
                loc_err_q75_mm=det.err_mm.quantile(.75),
+               loc_along_median_mm=det.err_along_mm.median(), loc_cross_median_mm=det.err_cross_mm.median(),
+               loc_cross_within_2mm=float((pos.err_cross_mm <= 2).mean()),
                **{f"loc_within_{t}mm": float((pos.err_mm <= t).mean()) for t in (2, 5, 10)})
     # RQ3 reliability
-    out.update(ece_raw=ece(f.conf, f.correct), ece_platt=ece(f.conf_platt, f.correct),
-               aurc=risk_coverage(f.conf, ~f.correct)[2], aurc_oracle=risk_coverage(f.correct, ~f.correct)[2])
+    for suffix, target in TARGETS.items():
+        y = f[target]
+        out.update({f"accuracy{suffix}": float(y.mean()),
+                    f"ece_raw{suffix}": ece(f.conf, y), f"ece_platt{suffix}": ece(f[f"conf_platt{suffix}"], y),
+                    f"aurc{suffix}": risk_coverage(f.conf, ~y)[2], f"aurc_oracle{suffix}": risk_coverage(y, ~y)[2]})
     if len(det) > 2:
         out["spearman_conf_err"] = spearmanr(det.conf, det.err_mm).statistic
     pl = pos.dropna(subset=["gt_long_mm"])
     if len(pl) > 2:
         out["spearman_conf_length"] = spearmanr(pl.conf, pl.gt_long_mm).statistic
         for name, sel in (("short", pl.gt_long_mm < 12), ("long", pl.gt_long_mm >= 12)):
-            out[f"detected_frac_{name}"] = float((pl[sel].conf >= thr).mean()) if sel.any() else np.nan
+            out[f"detected_frac_{name}"] = float(pl[sel].above.mean()) if sel.any() else np.nan
             out[f"conf_median_{name}"] = float(pl[sel].conf.median()) if sel.any() else np.nan
+            out[f"within_5mm_{name}"] = float((pl[sel].err_mm <= 5).mean()) if sel.any() else np.nan
+            out[f"cross_within_2mm_{name}"] = float((pl[sel].err_cross_mm <= 2).mean()) if sel.any() else np.nan
+            out[f"err_median_{name}"] = float(pl[sel & pl.above].err_mm.median()) if (sel & pl.above).any() else np.nan
     return out
 
 
@@ -190,49 +219,58 @@ def main():
     ap.add_argument("--name", default="loso_s")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--gate-mm", type=float, default=5.0)
+    ap.add_argument("--calib", choices=["fold", "pooled"], default="fold",
+                    help="fit threshold/Platt on the fold's own val segment, or on all other folds' val frames")
     args = ap.parse_args()
 
     pdir = ROOT / "results" / "predictions" / args.name / f"s{args.seed}"
-    out = ROOT / "results" / "metrics" / args.name / f"s{args.seed}"
+    out = ROOT / "results" / "metrics" / args.name / (f"s{args.seed}" + ("_pooledcal" if args.calib == "pooled" else ""))
     out.mkdir(parents=True, exist_ok=True)
     m, gt = load_gt()
     amb = ambiguous_frames()
 
+    folds_done = [k for k in range(1, 7) if (pdir / f"fold{k}_test.csv").exists()]
+    vals = {k: frame_table(pd.read_csv(pdir / f"fold{k}_val.csv"), m, gt, fold_segments(k)[1], amb, args.gate_mm)
+            for k in folds_done}
     all_frames, all_dets, rows = [], [], []
     for k in range(1, 7):
-        if not (pdir / f"fold{k}_test.csv").exists():
+        if k not in folds_done:
             print(f"fold {k}: no predictions yet")
             continue
         _, val_seg, test_seg = fold_segments(k)
-        val = frame_table(pd.read_csv(pdir / f"fold{k}_val.csv"), m, gt, val_seg, amb, args.gate_mm)
+        val = vals[k]
+        if args.calib == "pooled":
+            val = pd.concat([v for j, v in vals.items() if fold_segments(j)[1] != test_seg], ignore_index=True)
         tp = pd.read_csv(pdir / f"fold{k}_test.csv")
         test = frame_table(tp, m, gt, test_seg, amb, args.gate_mm)
-        test["conf_platt"] = platt(val)(test.conf)
+        for suffix, target in TARGETS.items():
+            test[f"conf_platt{suffix}"] = platt(val, target)(test.conf)
         test["fold"] = k
+        test["threshold"] = youden_threshold(val)
         dets = detection_table(tp, gt, test_seg, args.gate_mm)
         dets["fold"] = k
-        thr = youden_threshold(val)
         n_gt = int((gt.segment == test_seg).sum())
-        rows.append(dict(fold=k, test=test_seg, val=val_seg, **summarize(test, dets, n_gt, thr, args.gate_mm)))
-        all_frames.append(test.assign(threshold=thr))
+        rows.append(dict(fold=k, test=test_seg, val=val_seg, threshold=test.threshold.iloc[0],
+                         **summarize(test, dets, n_gt, args.gate_mm)))
+        all_frames.append(test)
         all_dets.append(dets)
 
     if not rows:
         return
     folds = pd.DataFrame(rows)
-    frames = pd.concat(all_frames)
+    frames = pd.concat(all_frames, ignore_index=True)
     dets = pd.concat(all_dets)
-    # pooled: every frame is a test frame exactly once; per-fold thresholds/calibration are already applied
-    pooled = summarize(frames.assign(conf=frames.conf), dets, int(gt.segment.isin(folds.test).sum()),
-                       float("nan"), args.gate_mm)
-    pos = frames[frames.has_seed]
-    pooled["vis_sensitivity"] = float((pos.conf >= pos.threshold).mean())
-    neg = frames[~frames.has_seed & ~frames.ambiguous]
-    pooled["vis_specificity"] = float((neg.conf < neg.threshold).mean())
-    det = pos[pos.conf >= pos.threshold]
-    pooled.update(loc_detected_frac=len(det) / len(pos), loc_err_median_mm=det.err_mm.median(),
-                  loc_err_q25_mm=det.err_mm.quantile(.25), loc_err_q75_mm=det.err_mm.quantile(.75))
-    pooled.pop("threshold")
+    # pooled: every frame is a test frame exactly once; each fold's own threshold and calibration apply
+    pooled = summarize(frames, dets, int(gt.segment.isin(folds.test).sum()), args.gate_mm)
+
+    bg = yaml.safe_load((ROOT / "configs" / "backgrounds.yaml").read_text())["segments"]
+    by_bg = {}
+    for name in sorted(set(bg.values())):
+        segs = [s for s, b in bg.items() if b == name and s in set(folds.test)]
+        if segs:
+            by_bg[name] = summarize(frames[frames.segment.isin(segs)], dets[dets.segment.isin(segs)],
+                                    int(gt.segment.isin(segs).sum()), args.gate_mm)
+    pd.DataFrame(by_bg).round(4).to_csv(out / "by_background.csv")
 
     frames.round(4).to_csv(out / "frames.csv", index=False)
     dets.drop(columns=[c for c in dets.columns if c.startswith("p") and c[1:].isdigit()]).round(4).to_csv(

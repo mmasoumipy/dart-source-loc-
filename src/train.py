@@ -1,6 +1,7 @@
-"""Train one LOSO fold of YOLO26-m OBB and save raw predictions for the val and test segments.
+"""Train one LOSO fold of YOLO26 (OBB or axis-aligned detect) and save raw predictions for the val and test segments.
 
 Usage: python -m src.train --fold 3 [--seed 0] [--epochs N] [--model weights/yolo26s-obb.pt --batch 8 --name loso_s]
+       python -m src.train --fold 3 --model weights/yolo26s.pt --data-dir data/prepared_aabb --name loso_aabb
 
 Outputs
   runs/loso/s<seed>/fold<k>/            Ultralytics run (weights, curves; git-ignored)
@@ -9,19 +10,14 @@ Outputs
 import argparse
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import yaml
 from ultralytics import YOLO
 
-from src.data.io import SEGMENTS, load_manifest
+from src.data.io import fold_segments, load_manifest
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def fold_segments(k):
-    test = SEGMENTS[k - 1]
-    val = SEGMENTS[k % len(SEGMENTS)]
-    return [s for s in SEGMENTS if s not in (test, val)], val, test
 
 
 def image_lists(cfg, k):
@@ -56,12 +52,19 @@ def predict_to_csv(model, df, out_csv, imgsz, pcfg):
                                        df.segment.iloc[start:start + 32],
                                        model.predict(paths[start:start + 32], imgsz=imgsz, conf=pcfg["conf"],
                                                      max_det=pcfg["max_det"], verbose=False)):
-            if r.obb is None or len(r.obb) == 0:
+            b = r.obb if r.obb is not None else r.boxes
+            if b is None or len(b) == 0:
                 rows.append(dict(segment=seg, frame=frame, det=-1))
                 continue
-            xywhr = r.obb.xywhr.cpu().numpy()
-            corners = r.obb.xyxyxyxy.cpu().numpy().reshape(-1, 8)
-            for i, conf in enumerate(r.obb.conf.cpu().numpy()):
+            if r.obb is not None:
+                xywhr = b.xywhr.cpu().numpy()
+                corners = b.xyxyxyxy.cpu().numpy().reshape(-1, 8)
+            else:  # axis-aligned: rot 0, corners clockwise from top-left
+                xywh = b.xywh.cpu().numpy()
+                xywhr = np.c_[xywh, np.zeros(len(xywh))]
+                x0, y0, x1, y1 = b.xyxy.cpu().numpy().T
+                corners = np.stack([x0, y0, x1, y0, x1, y1, x0, y1], 1)
+            for i, conf in enumerate(b.conf.cpu().numpy()):
                 rows.append(dict(segment=seg, frame=frame, det=i, conf=float(conf),
                                  cx=xywhr[i, 0], cy=xywhr[i, 1], w=xywhr[i, 2], h=xywhr[i, 3], rot=xywhr[i, 4],
                                  **{f"p{j}": corners[i, j] for j in range(8)}))
@@ -77,6 +80,9 @@ def main():
     ap.add_argument("--name", default="loso")
     ap.add_argument("--model", help="override config model, e.g. weights/yolo26s-obb.pt")
     ap.add_argument("--batch", type=int)
+    ap.add_argument("--data-dir", help="override config data_dir, e.g. data/prepared_aabb")
+    ap.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE",
+                    help="override train settings, e.g. --set translate=0.4 scale=0.5")
     args = ap.parse_args()
 
     cfg = yaml.safe_load((ROOT / "configs" / "train.yaml").read_text())
@@ -87,6 +93,11 @@ def main():
         tcfg["batch"] = args.batch
     if args.model:
         cfg["model"] = args.model
+    if args.data_dir:
+        cfg["data_dir"] = args.data_dir
+    for kv in args.set:
+        key, value = kv.split("=", 1)
+        tcfg[key] = yaml.safe_load(value)
     run_dir = ROOT / "runs" / args.name / f"s{args.seed}" / f"fold{args.fold}"
     lists = image_lists(cfg, args.fold)
     print({k: f"{sorted(v.segment.unique())} n={len(v)}" for k, v in lists.items()})

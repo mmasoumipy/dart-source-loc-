@@ -19,3 +19,10 @@ __pycache__/
 
 
 ROADMAP.md
+# local-only derived data (patient images)
+data/
+review/
+
+
+ref_doc/
+.venv-rcnn/

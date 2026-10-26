@@ -1,4 +1,4 @@
-# Leave-one-segment-out on the 6 patient EUS segments.
+# Leave-one-segment-out on the 6 EUS segments (phantom / ex vivo tissue, see configs/backgrounds.yaml).
 # Fold k: test = segment k, val = segment (k mod 6) + 1, train = the remaining four.
 model: weights/yolo26s-obb.pt   # main model (s); m is weights/yolo26m-obb.pt with batch 4
 data_dir: data/prepared            # masked frames from src/data/prepare.py

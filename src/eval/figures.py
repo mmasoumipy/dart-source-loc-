@@ -44,17 +44,20 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     f = pd.read_csv(src)
     f = f[~f.ambiguous]
-    correct = f.correct.to_numpy(float)
     stem = f"{args.name}_s{args.seed}"
 
-    # Reliability diagram: raw vs Platt-calibrated
+    defs = (("correct", "conf_platt", BLUE, "centre within 5 mm"),
+            ("correct_line", "conf_platt_line", ORANGE, "within 2 mm of source line"))
+
+    # Reliability diagram: raw confidence against both definitions of correct
     fig, ax = plt.subplots(figsize=(3.3, 3.0))
     ax.plot([0, 1], [0, 1], color=MUTED, lw=1, ls="--", label="perfect calibration")
-    for col, color, name in (("conf", BLUE, "raw"), ("conf_platt", ORANGE, "Platt (val segment)")):
-        c = f[col].to_numpy()
-        x, y = reliability(ax, c, correct)
-        ax.plot(x, y, color=color, marker="o", ms=4, label=f"{name}, ECE {ece(c, correct):.3f}")
-    ax.set(xlabel="confidence (top-1 per frame)", ylabel="fraction correct (centre ≤ gate)", xlim=(0, 1), ylim=(0, 1))
+    c = f.conf.to_numpy()
+    for target, _, color, name in defs:
+        y = f[target].to_numpy(float)
+        x, yy = reliability(ax, c, y)
+        ax.plot(x, yy, color=color, marker="o", ms=4, label=f"{name}, ECE {ece(c, y):.2f}")
+    ax.set(xlabel="confidence (top-1 per frame)", ylabel="fraction correct", xlim=(0, 1), ylim=(0, 1))
     ax.legend(loc="upper left", fontsize=7)
     fig.tight_layout()
     for ext in ("pdf", "png"):
@@ -62,27 +65,33 @@ def main():
 
     # Risk-coverage: reject low-confidence frames first
     fig, ax = plt.subplots(figsize=(3.3, 3.0))
-    loss = 1 - correct
-    for score, color, name in ((f.conf.to_numpy(), BLUE, "model confidence"),
-                               (correct, AQUA, "oracle")):
-        cov, risk, aurc = risk_coverage(score, loss)
-        ax.plot(cov, risk, color=color, label=f"{name} (AURC {aurc:.3f})")
-    ax.axhline(loss.mean(), color=MUTED, lw=1, ls="--", label="no rejection")
-    ax.set(xlabel="coverage (fraction of frames accepted)", ylabel="risk (1 − fraction correct)", xlim=(0, 1), ylim=(0, None))
-    ax.legend(loc="upper left", fontsize=7)
+    for target, _, color, name in defs:
+        loss = 1 - f[target].to_numpy(float)
+        cov, risk, aurc = risk_coverage(c, loss)
+        ax.plot(cov, risk, color=color, label=f"{name} (AURC {aurc:.2f})")
+        ax.axhline(loss.mean(), color=color, lw=1, ls="--")
+    ax.plot([], [], color=MUTED, lw=1, ls="--", label="no rejection")
+    ax.set(xlabel="coverage (fraction of frames accepted)", ylabel="risk (1 − fraction correct)",
+           xlim=(0, 1), ylim=(0, 1))
+    ax.legend(loc="upper right", fontsize=7)
     fig.tight_layout()
     for ext in ("pdf", "png"):
         fig.savefig(out / f"{stem}_risk_coverage.{ext}")
 
-    # Confidence vs labelled visible length (orientation proxy)
+    # Confidence by labelled visible length: partly visible (<12 mm) vs fully in plane (>=12 mm)
     p = f[f.has_seed].dropna(subset=["gt_long_mm"])
+    groups = [("partly visible\n(< 12 mm)", p[p.gt_long_mm < 12].conf), ("fully in plane\n(≥ 12 mm)", p[p.gt_long_mm >= 12].conf)]
     fig, ax = plt.subplots(figsize=(3.3, 3.0))
-    ax.scatter(p.gt_long_mm, p.conf, s=8, color=BLUE, alpha=0.35, linewidths=0)
-    bins = np.arange(0, p.gt_long_mm.max() + 2, 2)
-    mid = p.groupby(pd.cut(p.gt_long_mm, bins), observed=True).conf.median()
-    ax.plot([i.mid for i in mid.index], mid.to_numpy(), color=INK, lw=2, label="median per 2 mm bin")
-    ax.set(xlabel="labelled visible source length (mm)", ylabel="top-1 confidence", ylim=(0, 1))
-    ax.legend(loc="lower right", fontsize=7)
+    rng = np.random.default_rng(0)
+    for i, (name, v) in enumerate(groups):
+        ax.scatter(i + rng.uniform(-0.18, 0.18, len(v)), v, s=6, color=BLUE, alpha=0.25, linewidths=0)
+        q1, med, q3 = np.percentile(v, [25, 50, 75])
+        ax.plot([i - 0.28, i + 0.28], [med, med], color=INK, lw=2)
+        ax.plot([i, i], [q1, q3], color=INK, lw=1)
+        ax.text(i + 0.3, med, f"median {med:.2f}\nn={len(v)}", va="center", fontsize=7, color=INK2)
+    ax.set_xticks([0, 1], [g[0] for g in groups])
+    ax.set(ylabel="top-1 confidence", ylim=(0, 1), xlim=(-0.5, 1.9))
+    ax.grid(axis="x", visible=False)
     fig.tight_layout()
     for ext in ("pdf", "png"):
         fig.savefig(out / f"{stem}_conf_vs_length.{ext}")

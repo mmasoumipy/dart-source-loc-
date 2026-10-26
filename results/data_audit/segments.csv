@@ -1,0 +1,7 @@
+segment,frames,first_frame,last_frame,frames_with_seed,frames_multi_seed,boxes,long_mm_median,short_mm_median,angle_deg_median,cx_px_median,cy_px_median,suspicious_runs,suspicious_frames
+segment1,225,0,224,138,0,138,11.16,2.06,135.0,1015.16,548.97,5,11
+segment2,254,229,482,242,0,242,21.84,3.34,120.0,1188.17,430.81,4,4
+segment3,456,520,976,407,0,407,22.3,2.74,120.0,1268.87,402.21,7,17
+segment4,524,1036,1561,516,0,516,7.2,1.94,120.0,1268.64,230.17,6,6
+segment5,500,1749,2248,439,401,840,6.3,0.93,135.0,1124.38,256.44,2,2
+segment6,749,2283,3031,370,2,372,21.64,3.04,135.0,1081.26,472.27,13,27

@@ -1,0 +1,27 @@
+tick_mm: 2.5
+segments:
+  segment1:
+    tick_px: 74.5
+    mm_per_px: 0.03356
+    frames_sampled: 20
+  segment2:
+    tick_px: 75.0
+    mm_per_px: 0.03333
+    frames_sampled: 20
+  segment3:
+    tick_px: 75.0
+    mm_per_px: 0.03333
+    frames_sampled: 20
+  segment4:
+    tick_px: 75.0
+    mm_per_px: 0.03333
+    frames_sampled: 20
+  segment5:
+    tick_px: 74.75
+    mm_per_px: 0.03344
+    frames_sampled: 20
+  segment6:
+    tick_px: 75.0
+    mm_per_px: 0.03333
+    frames_sampled: 20
+mm_per_px: 0.03333

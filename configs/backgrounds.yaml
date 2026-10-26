@@ -1,0 +1,11 @@
+# Imaging background per segment, for the per-background breakdown in src.eval.evaluate.
+# TENTATIVE: assigned by eye from one frame per segment (uniform speckle with round inclusions = phantom,
+# heterogeneous = tissue). Confirm with the person who recorded the data before reporting.
+confirmed: false
+segments:
+  segment1: phantom
+  segment2: phantom
+  segment3: tissue
+  segment4: phantom
+  segment5: tissue
+  segment6: tissue
